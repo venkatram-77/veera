@@ -37,12 +37,13 @@ type RecognitionEvent = {
   resultIndex: number;
   results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }>;
 };
+type RecognitionErrorEvent = { error?: string };
 type Recognition = {
   lang: string;
   continuous: boolean;
   interimResults: boolean;
   onresult: ((event: RecognitionEvent) => void) | null;
-  onerror: (() => void) | null;
+  onerror: ((event: RecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
@@ -53,6 +54,24 @@ const api = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) throw new Error(data.error ?? `Request failed (${response.status})`);
   return data;
+};
+
+const voiceErrorMessage = (code?: string) => {
+  switch (code) {
+    case "not-allowed":
+    case "service-not-allowed":
+      return "Microphone access denied. Allow mic permission for this site and try again.";
+    case "audio-capture":
+      return "No microphone was found. Connect one and try again.";
+    case "no-speech":
+      return "I didn't hear anything. Tap the mic and speak again.";
+    case "network":
+      return "Voice recognition needs an internet connection in Chrome or Edge.";
+    case "aborted":
+      return "";
+    default:
+      return "Voice input failed. Check your microphone and try again.";
+  }
 };
 
 export default function ChatApp() {
@@ -79,6 +98,10 @@ export default function ChatApp() {
   const [speak, setSpeak] = useState(false);
   const [listening, setListening] = useState(false);
   const recognitionRef = useRef<Recognition | null>(null);
+  const listeningRef = useRef(false);
+  const speechHandledRef = useRef(false);
+  const voiceReplyRef = useRef(false);
+  const busyRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -221,8 +244,14 @@ export default function ChatApp() {
   };
 
   const toggleMic = () => {
-    if (listening) {
+    if (busyRef.current) {
+      setError("Wait for the current reply before using voice input.");
+      return;
+    }
+    if (listeningRef.current) {
       recognitionRef.current?.stop();
+      listeningRef.current = false;
+      voiceReplyRef.current = false;
       setListening(false);
       return;
     }
@@ -235,37 +264,80 @@ export default function ChatApp() {
       setError("Voice input is not supported in this browser. Try Chrome or Edge.");
       return;
     }
+
     const recognition = new RecognitionClass();
     recognition.lang = navigator.language || "en-US";
     recognition.continuous = false;
     recognition.interimResults = true;
+    speechHandledRef.current = false;
+    voiceReplyRef.current = true;
+
     recognition.onresult = (event) => {
-      let transcript = "";
+      let finalText = "";
+      let interimText = "";
       for (let index = 0; index < event.results.length; index += 1) {
-        transcript += event.results[index][0].transcript;
+        const result = event.results[index];
+        const transcript = result[0]?.transcript ?? "";
+        if (result.isFinal) finalText += `${transcript} `;
+        else interimText += transcript;
       }
-      setInput(transcript);
+      finalText = finalText.trim();
+
+      if (!speechHandledRef.current) setInput(`${finalText} ${interimText}`.trim());
+
+      // One finished phrase is enough — send it straight to the assistant.
+      if (finalText && !speechHandledRef.current) {
+        speechHandledRef.current = true;
+        setInput(finalText);
+        listeningRef.current = false;
+        setListening(false);
+        recognitionRef.current = null;
+        try {
+          recognition.stop();
+        } catch {
+          // Recognition may already have ended; the transcript is still valid.
+        }
+        void send(finalText);
+      }
     };
-    recognition.onerror = () => {
+
+    recognition.onerror = (event) => {
+      if (speechHandledRef.current || event.error === "aborted") return;
+      listeningRef.current = false;
+      voiceReplyRef.current = false;
+      recognitionRef.current = null;
       setListening(false);
-      setError("Voice input failed. Check your microphone permission.");
+      setError(voiceErrorMessage(event.error));
     };
-    recognition.onend = () => setListening(false);
+
+    recognition.onend = () => {
+      listeningRef.current = false;
+      recognitionRef.current = null;
+      if (!speechHandledRef.current) voiceReplyRef.current = false;
+      setListening(false);
+    };
+
     recognitionRef.current = recognition;
     try {
       recognition.start();
+      listeningRef.current = true;
       setListening(true);
       setError("");
     } catch {
-      setError("Could not start voice input.");
+      listeningRef.current = false;
+      voiceReplyRef.current = false;
+      recognitionRef.current = null;
+      setListening(false);
+      setError("Could not start voice input. Check your microphone permission.");
     }
   };
 
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
+  const send = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
+    if (!text || busyRef.current) return;
     setInput("");
     setError("");
+    busyRef.current = true;
     setBusy(true);
 
     const userMessage: UiMessage = { id: crypto.randomUUID(), role: "user", content: text };
@@ -376,7 +448,7 @@ export default function ChatApp() {
           item.id === assistantId ? { ...item, content: answer, streaming: false } : item,
         ),
       );
-      if (speak && answer) {
+      if ((speak || voiceReplyRef.current) && answer) {
         // Use edge-tts on the server for a natural neural voice (no GPU use).
         void fetch("/api/tts", {
           method: "POST",
@@ -404,6 +476,8 @@ export default function ChatApp() {
         ),
       );
     } finally {
+      busyRef.current = false;
+      voiceReplyRef.current = false;
       setBusy(false);
       abortRef.current = null;
     }
@@ -744,6 +818,11 @@ export default function ChatApp() {
               {busy ? <MoreHorizontal className="h-4 w-4" /> : <Send className="h-4 w-4" />}
             </button>
           </div>
+          {listening && (
+            <p className="mt-2 text-center text-[11px] font-medium text-indigo-600 dark:text-indigo-400">
+              Listening… speak now, and I&apos;ll reply when you finish.
+            </p>
+          )}
           <p className="mt-2 text-center text-[10px] text-zinc-400">
             Veera runs locally via Ollama · sentiment via your ONNX model
           </p>
